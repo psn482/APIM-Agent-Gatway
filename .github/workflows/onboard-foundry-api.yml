@@ -1,0 +1,125 @@
+name: Onboard Foundry Agent to APIM Gateway
+
+on:
+  workflow_dispatch:
+    inputs:
+      foundryName:
+        description: "Azure AI Foundry instance name (e.g. my-foundry-dev)"
+        required: true
+        type: string
+      projectId:
+        description: "Foundry project ID (e.g. proj-default)"
+        required: true
+        type: string
+      agentMappingJson:
+        description: 'Agent map JSON — {"agentName":"assistantId"}'
+        required: true
+        type: string
+      useCaseName:
+        description: "Use case name (used in Named Value naming, e.g. devops)"
+        required: true
+        type: string
+      apiId:
+        description: "APIM API ID (e.g. foundry-agents)"
+        required: true
+        default: "foundry-agents"
+        type: string
+      operationId:
+        description: "APIM Operation ID (e.g. invoke-agent)"
+        required: true
+        default: "invoke-agent"
+        type: string
+      operationPath:
+        description: "URL path for the operation (e.g. /agents/invoke)"
+        required: true
+        default: "/agents/invoke"
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+jobs:
+
+  # ── Validate inputs before touching Azure ──────────────────────────────────
+  validate:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate agentMappingJson
+        run: |
+          echo '${{ github.event.inputs.agentMappingJson }}' | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              if not isinstance(data, dict) or not data:
+                  raise ValueError('Must be a non-empty JSON object')
+              agents = list(data.keys())
+              print(f'✅ Valid agent map — {len(agents)} agent(s): {agents}')
+          except Exception as e:
+              print(f'❌ Invalid agentMappingJson: {e}')
+              sys.exit(1)
+          "
+
+  # ── Deploy ─────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy APIM Policies
+        env:
+          SUBSCRIPTION_ID:      ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          APIM_RESOURCE_GROUP:  ${{ secrets.APIM_RESOURCE_GROUP }}
+          APIM_SERVICE_NAME:    ${{ secrets.APIM_SERVICE_NAME }}
+          AZURE_TENANT_ID:      ${{ secrets.AZURE_TENANT_ID }}
+          FOUNDRY_NAME:         ${{ github.event.inputs.foundryName }}
+          FOUNDRY_PROJECT_ID:   ${{ github.event.inputs.projectId }}
+          AGENT_MAP_JSON:       ${{ github.event.inputs.agentMappingJson }}
+          USE_CASE_NAME:        ${{ github.event.inputs.useCaseName }}
+          APIM_API_ID:          ${{ github.event.inputs.apiId }}
+          APIM_OPERATION_ID:    ${{ github.event.inputs.operationId }}
+          APIM_OPERATION_PATH:  ${{ github.event.inputs.operationPath }}
+        run: python scripts/setup_apim.py
+
+      - name: Write Job Summary
+        run: |
+          echo "## ✅ Foundry APIM Gateway — Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ github.event.inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Use Case | \`${{ github.event.inputs.useCaseName }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Foundry | \`${{ github.event.inputs.foundryName }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | \`${{ github.event.inputs.projectId }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| API | \`${{ github.event.inputs.apiId }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Operation | \`POST ${{ github.event.inputs.operationPath }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Named Value" >> $GITHUB_STEP_SUMMARY
+          echo "\`agent-map-${{ github.event.inputs.useCaseName }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Agent Mapping" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          echo '${{ github.event.inputs.agentMappingJson }}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

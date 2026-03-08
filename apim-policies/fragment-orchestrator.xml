@@ -1,0 +1,367 @@
+<fragment>
+
+  <!-- ================================================================
+       foundry-agent-orchestrator
+       Deploy ONCE per APIM service. Reused across all use cases.
+
+       Handles:
+         - JWT validation (signature, expiry, audience, issuer)
+         - Input field validation (all 4 required fields)
+         - Agent allowlist lookup via Named Value
+         - Dynamic Foundry endpoint construction
+         - POST /threads  → POST /messages  → POST /runs
+         - GET /runs poll loop (up to 24 retries × 1s)
+         - GET /messages → return final reply
+         - Per-step structured error responses
+       ================================================================ -->
+
+  <!-- STEP 1: Fast-fail if Authorization header is missing -->
+  <check-header name="Authorization"
+                failed-check-httpcode="401"
+                failed-check-error-message="Authorization header is missing. Please provide a valid Bearer token." />
+
+  <!-- STEP 2: Full JWT validation — signature, expiry, audience, issuer -->
+  <validate-jwt header-name="Authorization"
+                failed-validation-httpcode="401"
+                failed-validation-error-message="Token validation failed. Ensure your token is valid, not expired, and issued by the correct tenant."
+                require-expiration-time="true"
+                require-signed-tokens="true"
+                output-token-variable-name="jwt">
+    <openid-config url="https://login.microsoftonline.com/{{tenant-id}}/.well-known/openid-configuration" />
+    <required-claims>
+      <claim name="aud" match="any">
+        <value>https://ai.azure.com</value>
+        <value>https://management.azure.com/</value>
+      </claim>
+     
+    </required-claims>
+  </validate-jwt>
+
+  <!-- Capture caller's token for forwarding to Foundry -->
+  <set-variable name="callerToken"
+                value="@(context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;))" />
+
+  <!-- STEP 3: Parse request body -->
+  <set-variable name="requestBody" value="@{
+    try   { return context.Request.Body.As&lt;JObject&gt;(preserveContent: true); }
+    catch { return null; }
+  }" />
+
+  <choose>
+    <when condition="@(context.Variables.GetValueOrDefault&lt;JObject&gt;(&quot;requestBody&quot;) == null)">
+      <return-response>
+        <set-status code="400" reason="Bad Request" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"invalid_request","message":"Request body is missing or not valid JSON.","hint":"Provide a JSON body with fields: foundryName, projectId, agentName, message."}</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- STEP 4: Extract all required fields -->
+  <set-variable name="foundryName"
+                value="@((string)((JObject)context.Variables[&quot;requestBody&quot;])[&quot;foundryName&quot;])" />
+  <set-variable name="projectId"
+                value="@((string)((JObject)context.Variables[&quot;requestBody&quot;])[&quot;projectId&quot;])" />
+  <set-variable name="agentName"
+                value="@((string)((JObject)context.Variables[&quot;requestBody&quot;])[&quot;agentName&quot;])" />
+  <set-variable name="userMessage"
+                value="@((string)((JObject)context.Variables[&quot;requestBody&quot;])[&quot;message&quot;])" />
+
+  <!-- Validate foundryName -->
+  <choose>
+    <when condition="@(string.IsNullOrWhiteSpace((string)context.Variables[&quot;foundryName&quot;]))">
+      <return-response>
+        <set-status code="400" reason="Bad Request" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"missing_field","field":"foundryName","message":"'foundryName' is required and cannot be empty."}</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- Validate projectId -->
+  <choose>
+    <when condition="@(string.IsNullOrWhiteSpace((string)context.Variables[&quot;projectId&quot;]))">
+      <return-response>
+        <set-status code="400" reason="Bad Request" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"missing_field","field":"projectId","message":"'projectId' is required and cannot be empty."}</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- Validate agentName -->
+  <choose>
+    <when condition="@(string.IsNullOrWhiteSpace((string)context.Variables[&quot;agentName&quot;]))">
+      <return-response>
+        <set-status code="400" reason="Bad Request" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"missing_field","field":"agentName","message":"'agentName' is required and cannot be empty."}</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- Validate message -->
+  <choose>
+    <when condition="@(string.IsNullOrWhiteSpace((string)context.Variables[&quot;userMessage&quot;]))">
+      <return-response>
+        <set-status code="400" reason="Bad Request" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"missing_field","field":"message","message":"'message' is required and cannot be empty."}</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- STEP 5: Build Foundry endpoint dynamically -->
+  <set-variable name="foundryEndpoint" value="@(
+    &quot;https://&quot; + (string)context.Variables[&quot;foundryName&quot;] +
+    &quot;.services.ai.azure.com/api/projects/&quot; +
+    (string)context.Variables[&quot;projectId&quot;]
+  )" />
+
+  <!-- STEP 6: Resolve agentName → assistantId from Named Value allowlist -->
+  <set-variable name="assistantId" value="@{
+    try {
+      var map  = JObject.Parse((string)context.Variables[&quot;agentMapNamedValue&quot;]);
+      var name = (string)context.Variables[&quot;agentName&quot;];
+      if (map[name] == null) { return null; }
+      return map[name].ToString();
+    }
+    catch { return null; }
+  }" />
+
+  <choose>
+    <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;assistantId&quot;) == null)">
+      <return-response>
+        <set-status code="404" reason="Agent Not Found" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          return new JObject(
+            new JProperty("error",   "agent_not_found"),
+            new JProperty("field",   "agentName"),
+            new JProperty("message", $"Agent '{(string)context.Variables["agentName"]}' was not found in the agent map. Check agentName or update the Named Value.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- STEP 7: Create thread -->
+  <send-request mode="new" response-variable-name="threadResp" timeout="30" ignore-error="false">
+    <set-url>@((string)context.Variables[&quot;foundryEndpoint&quot;] + &quot;/threads?api-version=2025-05-01&quot;)</set-url>
+    <set-method>POST</set-method>
+    <set-header name="Authorization" exists-action="override">
+      <value>@((string)context.Variables[&quot;callerToken&quot;])</value>
+    </set-header>
+    <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+    <set-body>{}</set-body>
+  </send-request>
+
+  <choose>
+    <when condition="@(((IResponse)context.Variables[&quot;threadResp&quot;]).StatusCode != 200
+                    &amp;&amp; ((IResponse)context.Variables[&quot;threadResp&quot;]).StatusCode != 201)">
+      <return-response>
+        <set-status code="502" reason="Thread Creation Failed" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          var status = ((IResponse)context.Variables["threadResp"]).StatusCode;
+          var msg = (status == 401 || status == 403)
+            ? "Your identity does not have permission to access this Azure AI Foundry project. Verify your RBAC role on the Foundry resource."
+            : $"Failed to create a conversation thread on Azure AI Foundry (HTTP {status}). Please retry or contact support.";
+          return new JObject(
+            new JProperty("error",         "thread_creation_failed"),
+            new JProperty("foundryStatus", status),
+            new JProperty("message",       msg)
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <set-variable name="threadId"
+                value="@(((IResponse)context.Variables[&quot;threadResp&quot;]).Body.As&lt;JObject&gt;()[&quot;id&quot;].ToString())" />
+
+  <!-- STEP 8: Add user message to thread -->
+  <send-request mode="new" response-variable-name="msgResp" timeout="30" ignore-error="false">
+    <set-url>@((string)context.Variables[&quot;foundryEndpoint&quot;] + &quot;/threads/&quot; + (string)context.Variables[&quot;threadId&quot;] + &quot;/messages?api-version=2025-05-01&quot;)</set-url>
+    <set-method>POST</set-method>
+    <set-header name="Authorization" exists-action="override">
+      <value>@((string)context.Variables[&quot;callerToken&quot;])</value>
+    </set-header>
+    <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+    <set-body>@{
+      return new JObject(
+        new JProperty("role",    "user"),
+        new JProperty("content", (string)context.Variables["userMessage"])
+      ).ToString();
+    }</set-body>
+  </send-request>
+
+  <choose>
+    <when condition="@(((IResponse)context.Variables[&quot;msgResp&quot;]).StatusCode != 200
+                    &amp;&amp; ((IResponse)context.Variables[&quot;msgResp&quot;]).StatusCode != 201)">
+      <return-response>
+        <set-status code="502" reason="Message Post Failed" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          var status = ((IResponse)context.Variables["msgResp"]).StatusCode;
+          return new JObject(
+            new JProperty("error",         "message_post_failed"),
+            new JProperty("threadId",      (string)context.Variables["threadId"]),
+            new JProperty("foundryStatus", status),
+            new JProperty("message",       $"Failed to post message to thread (HTTP {status}).")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <!-- STEP 9: Trigger the agent run -->
+  <send-request mode="new" response-variable-name="runResp" timeout="30" ignore-error="false">
+    <set-url>@((string)context.Variables[&quot;foundryEndpoint&quot;] + &quot;/threads/&quot; + (string)context.Variables[&quot;threadId&quot;] + &quot;/runs?api-version=2025-05-01&quot;)</set-url>
+    <set-method>POST</set-method>
+    <set-header name="Authorization" exists-action="override">
+      <value>@((string)context.Variables[&quot;callerToken&quot;])</value>
+    </set-header>
+    <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+    <set-body>@{
+      return new JObject(
+        new JProperty("assistant_id", (string)context.Variables["assistantId"])
+      ).ToString();
+    }</set-body>
+  </send-request>
+
+  <choose>
+    <when condition="@(((IResponse)context.Variables[&quot;runResp&quot;]).StatusCode != 200
+                    &amp;&amp; ((IResponse)context.Variables[&quot;runResp&quot;]).StatusCode != 201)">
+      <return-response>
+        <set-status code="502" reason="Run Creation Failed" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          var status = ((IResponse)context.Variables["runResp"]).StatusCode;
+          return new JObject(
+            new JProperty("error",         "run_creation_failed"),
+            new JProperty("threadId",      (string)context.Variables["threadId"]),
+            new JProperty("assistantId",   (string)context.Variables["assistantId"]),
+            new JProperty("foundryStatus", status),
+            new JProperty("message",       $"Failed to start the agent run (HTTP {status}). Verify the agentName maps to a valid deployed assistant.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+  </choose>
+
+  <set-variable name="runId"
+                value="@(((IResponse)context.Variables[&quot;runResp&quot;]).Body.As&lt;JObject&gt;()[&quot;id&quot;].ToString())" />
+
+  <!-- STEP 10: Poll run status — exit immediately on any terminal state -->
+  <set-variable name="runStatus" value="queued" />
+
+  <retry count="24" interval="1" condition="@{
+    var terminalStates = new[] { &quot;completed&quot;, &quot;failed&quot;, &quot;cancelled&quot;, &quot;expired&quot;, &quot;requires_action&quot; };
+    return !terminalStates.Contains((string)context.Variables[&quot;runStatus&quot;]);
+  }">
+    <send-request mode="new" response-variable-name="statusResp" timeout="30" ignore-error="false">
+      <set-url>@((string)context.Variables[&quot;foundryEndpoint&quot;] + &quot;/threads/&quot; + (string)context.Variables[&quot;threadId&quot;] + &quot;/runs/&quot; + (string)context.Variables[&quot;runId&quot;] + &quot;?api-version=2025-05-01&quot;)</set-url>
+      <set-method>GET</set-method>
+      <set-header name="Authorization" exists-action="override">
+        <value>@((string)context.Variables[&quot;callerToken&quot;])</value>
+      </set-header>
+    </send-request>
+    <set-variable name="runStatus" value="@{
+      var body = ((IResponse)context.Variables[&quot;statusResp&quot;]).Body.As&lt;JObject&gt;();
+      return body?[&quot;status&quot;]?.ToString() ?? &quot;unknown&quot;;
+    }" />
+  </retry>
+
+  <!-- STEP 11: Handle all terminal run states -->
+  <choose>
+
+    <when condition="@((string)context.Variables[&quot;runStatus&quot;] == &quot;completed&quot;)">
+      <send-request mode="new" response-variable-name="finalMessages" timeout="30" ignore-error="false">
+        <set-url>@((string)context.Variables[&quot;foundryEndpoint&quot;] + &quot;/threads/&quot; + (string)context.Variables[&quot;threadId&quot;] + &quot;/messages?api-version=2025-05-01&quot;)</set-url>
+        <set-method>GET</set-method>
+        <set-header name="Authorization" exists-action="override">
+          <value>@((string)context.Variables[&quot;callerToken&quot;])</value>
+        </set-header>
+      </send-request>
+      <return-response response-variable-name="finalMessages" />
+    </when>
+
+    <when condition="@((string)context.Variables[&quot;runStatus&quot;] == &quot;failed&quot;)">
+      <return-response>
+        <set-status code="500" reason="Agent Run Failed" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          return new JObject(
+            new JProperty("error",    "agent_run_failed"),
+            new JProperty("runId",    (string)context.Variables["runId"]),
+            new JProperty("threadId", (string)context.Variables["threadId"]),
+            new JProperty("message",  "The agent run failed. Please retry or contact support with the runId.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+
+    <when condition="@((string)context.Variables[&quot;runStatus&quot;] == &quot;cancelled&quot;)">
+      <return-response>
+        <set-status code="409" reason="Agent Run Cancelled" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          return new JObject(
+            new JProperty("error",    "agent_run_cancelled"),
+            new JProperty("runId",    (string)context.Variables["runId"]),
+            new JProperty("threadId", (string)context.Variables["threadId"]),
+            new JProperty("message",  "The agent run was cancelled. Please retry.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+
+    <when condition="@((string)context.Variables[&quot;runStatus&quot;] == &quot;expired&quot;)">
+      <return-response>
+        <set-status code="408" reason="Agent Run Expired" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          return new JObject(
+            new JProperty("error",    "agent_run_expired"),
+            new JProperty("runId",    (string)context.Variables["runId"]),
+            new JProperty("threadId", (string)context.Variables["threadId"]),
+            new JProperty("message",  "The agent run expired. Simplify your message or retry.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+
+    <when condition="@((string)context.Variables[&quot;runStatus&quot;] == &quot;requires_action&quot;)">
+      <return-response>
+        <set-status code="202" reason="Action Required" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          return new JObject(
+            new JProperty("error",    "requires_action"),
+            new JProperty("runId",    (string)context.Variables["runId"]),
+            new JProperty("threadId", (string)context.Variables["threadId"]),
+            new JProperty("message",  "The agent requires a tool call response. Submit the tool output to resume.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </when>
+
+    <otherwise>
+      <return-response>
+        <set-status code="202" reason="Still Processing" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          return new JObject(
+            new JProperty("status",   (string)context.Variables["runStatus"]),
+            new JProperty("runId",    (string)context.Variables["runId"]),
+            new JProperty("threadId", (string)context.Variables["threadId"]),
+            new JProperty("message",  "Agent still processing. Use runId and threadId to poll.")
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </otherwise>
+
+  </choose>
+
+</fragment>

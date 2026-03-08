@@ -1,0 +1,49 @@
+<!--
+  ============================================================
+  Operation Policy — Per Use Case
+  ============================================================
+  This is the ONLY policy you write per use case / API operation.
+  ONLY the Named Value reference changes between use cases.
+  All logic lives in the shared Policy Fragments.
+
+  Instructions:
+    1. Replace {{agent-map-devops}} with your Named Value name
+    2. Paste into: APIM Portal → APIs → Your API
+                   → Operations → Your Operation → Policies
+
+  Examples:
+    DevOps API  →  {{agent-map-devops}}
+    Finance API →  {{agent-map-finance}}
+    HR API      →  {{agent-map-hr}}
+
+  Named Value value format (JSON):
+    {"agentName": "assistantId", "agentName2": "assistantId2"}
+  ============================================================
+-->
+<policies>
+
+  <inbound>
+    <base />
+
+    <!-- ✅ ONLY THIS LINE CHANGES PER USE CASE -->
+    <set-variable name="agentMapNamedValue" value="{{agent-map-devops}}" />
+
+    <!-- ✅ All auth + validation + 5-call orchestration in fragment -->
+    <include-fragment fragment-id="foundry-agent-orchestrator" />
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+  </outbound>
+
+  <on-error>
+    <base />
+    <!-- ✅ All error handling in fragment -->
+    <include-fragment fragment-id="foundry-error-handler" />
+  </on-error>
+
+</policies>

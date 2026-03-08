@@ -1,0 +1,55 @@
+<fragment>
+
+  <!-- ================================================================
+       foundry-error-handler
+       Deploy ONCE per APIM service. Reused across all use cases.
+       Place inside <on-error> of every operation policy.
+
+       Handles:
+         - 401 / 403  →  access denied with RBAC guidance
+         - Timeout     →  504 with retry guidance
+         - Everything else → 500 with detail field
+       ================================================================ -->
+
+  <choose>
+
+    <!-- 401 / 403 from Foundry — RBAC / access denied -->
+    <when condition="@(context.Response != null
+                    &amp;&amp; (context.Response.StatusCode == 401
+                          || context.Response.StatusCode == 403))">
+      <return-response>
+        <set-status code="403" reason="Forbidden" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"access_denied","message":"Your identity does not have sufficient access to the Azure AI Foundry resource. Please verify your RBAC role assignment on the Foundry project or resource group."}</set-body>
+      </return-response>
+    </when>
+
+    <!-- Gateway timeout reaching Foundry -->
+    <when condition="@(context.LastError != null
+                    &amp;&amp; context.LastError.Reason == &quot;Timeout&quot;)">
+      <return-response>
+        <set-status code="504" reason="Gateway Timeout" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":"timeout","message":"The request to Azure AI Foundry timed out. Please retry. If this persists, your query may be too complex or the Foundry service may be experiencing latency."}</set-body>
+      </return-response>
+    </when>
+
+    <!-- Catch-all: unexpected errors -->
+    <otherwise>
+      <return-response>
+        <set-status code="500" reason="Internal Server Error" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@{
+          var reason = context.LastError?.Message ?? "Unknown error";
+          return new JObject(
+            new JProperty("error",   "internal_error"),
+            new JProperty("message", "An unexpected error occurred. Please retry or contact support."),
+            new JProperty("detail",  reason)
+          ).ToString();
+        }</set-body>
+      </return-response>
+    </otherwise>
+
+  </choose>
+
+</fragment>

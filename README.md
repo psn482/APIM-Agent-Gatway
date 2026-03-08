@@ -269,7 +269,7 @@ import requests
 from azure.identity import AzureCliCredential
 
 token = AzureCliCredential(tenant_id="<tenant-id>") \
-        .get_token("https://cognitiveservices.azure.com/.default").token
+        .get_token("https://ai.azure.com/.default").token
 
 response = requests.post(
     "https://<your-apim>.azure-api.net/<path>",

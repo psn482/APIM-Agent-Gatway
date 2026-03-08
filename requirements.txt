@@ -1,0 +1,12 @@
+# Azure AI Foundry — APIM Gateway
+# Python dependencies
+
+# Azure SDK
+azure-identity>=1.17.0
+azure-mgmt-apimanagement>=3.0.0
+
+# HTTP client
+requests>=2.32.0
+
+# Environment
+python-dotenv>=1.0.1
